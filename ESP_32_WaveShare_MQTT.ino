@@ -1,3 +1,61 @@
+﻿#include <WiFi.h>
+#include <Credentials\Credentials.h>
+#include "EEPROM.h" //For storing MD5 for OTA
+#include <Update.h>
+#include <PubSubClient.h>
+
+
+
+WiFiClient espClient;
+unsigned long reconnectionPeriod = 10000; //miliseconds
+unsigned long lastWifiConnectionAttempt = 0;
+bool HOME = true;
+const char* _SSID;
+const char* _PSWD;
+String host;
+
+
+PubSubClient client(espClient);
+unsigned long lastBrokerConnectionAttempt = 0;
+unsigned long lastSensorMsg = 0;
+char msg[50];
+int sensorRequestPeriod = 10; // seconds
+const char* mqtt_server;
+
+
+int flow;
+const int SETTINGS_SWITCH_1_PIN = 16;
+const int SETTINGS_SWITCH_2_PIN = 17;
+const int SETTINGS_SWITCH_3_PIN = 18;
+const int SETTINGS_SWITCH_4_PIN = 19;
+
+//-----------------HTTP_OTA------------------------
+
+/* Over The Air automatic firmware update from a web server.  ESP32 will contact the
+*  server on every boot and check for a firmware update.  If available, the update will
+*  be downloaded and installed.  Server can determine the appropriate firmware for this
+*  device from combination of HTTP_OTA_FIRMWARE and firmware MD5 checksums.
+*/
+
+// Name of firmware
+#define HTTP_OTA_FIRMWARE String(String(__FILE__).substring(String(__FILE__).lastIndexOf('\\')) + ".bin").substring(1)
+
+// Variables to validate response
+int contentLength = 0;
+bool isValidContentType = false;
+bool isNewFirmware = false;
+int port = HTTP_OTA_PORT;
+String binPath = String(HTTP_OTA_PATH) + HTTP_OTA_FIRMWARE;
+
+String MD5;
+int EEPROM_SIZE = 1024;
+int MD5_address = 0; // in EEPROM
+
+int sleepPeriod = 60; // Seconds
+
+
+
+
 // mapping suggestion for ESP32, e.g. LOLIN32, see .../variants/.../pins_arduino.h for your board
 // NOTE: there are variants with different pins for SPI ! CHECK SPI PINS OF YOUR BOARD
 // BUSY -> 4, RST -> 16, DC -> 17, CS -> SS(5), CLK -> SCK(18), DIN -> MOSI(23), GND -> GND, 3.3V -> 3.3V
@@ -10,61 +68,450 @@
 #include <../Adafruit_GFX_Library/Fonts/FreeMono9pt7b.h>
 #include <../Adafruit_GFX_Library/Fonts/FreeMonoBold9pt7b.h>
 
-
-
-// select one and adapt to your mapping, can use full buffer size (full HEIGHT)
-// 3-color e-papers
-//GxEPD2_3C<GxEPD2_154c, GxEPD2_154c::HEIGHT> display(GxEPD2_154c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
-//GxEPD2_3C<GxEPD2_213c, GxEPD2_213c::HEIGHT> display(GxEPD2_213c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
 GxEPD2_3C<GxEPD2_290c, GxEPD2_290c::HEIGHT> display(GxEPD2_290c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
-//GxEPD2_3C<GxEPD2_270c, GxEPD2_270c::HEIGHT> display(GxEPD2_270c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
-//GxEPD2_3C<GxEPD2_420c, GxEPD2_420c::HEIGHT> display(GxEPD2_420c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
-//GxEPD2_3C<GxEPD2_750c, GxEPD2_750c::HEIGHT> display(GxEPD2_750c(/*CS=5*/ SS, /*DC=*/ 17, /*RST=*/ 16, /*BUSY=*/ 4));
 
 #include "bitmaps/Bitmaps3c128x296.h" // 2.9"  b/w/r
+
+RTC_DATA_ATTR int variable;
 
 void setup()
 {
 	Serial.begin(115200);
-	Serial.println();
-	Serial.println("setup");
-	display.init(115200);
-	// first update should be full refresh
-	helloWorld();
-	delay(1000);
-	// partial refresh mode can be used to full screen,
-	// effective if display panel hasFastPartialUpdate
-	helloFullScreenPartialMode();
-	delay(1000);
-	helloArduino();
-	delay(1000);
-	helloEpaper();
-	delay(1000);
-	showFont("FreeMonoBold9pt7b", &FreeMonoBold9pt7b);
-	delay(1000);
-	drawBitmaps();
-	if (display.epd2.hasPartialUpdate)
-	{
-		showPartialUpdate();
-		delay(1000);
-	} // else // on GDEW0154Z04 only full update available, doesn't look nice
-	  //drawCornerTest();
-	  //showBox(16, 16, 48, 32, false);
-	  //showBox(16, 56, 48, 32, true);
-	display.powerOff();
-	Serial.println("setup done");
+	pinMode(SETTINGS_SWITCH_1_PIN, INPUT);
+	pinMode(SETTINGS_SWITCH_2_PIN, INPUT);
+	pinMode(SETTINGS_SWITCH_3_PIN, INPUT);
+	pinMode(SETTINGS_SWITCH_4_PIN, INPUT);
+	flow = getSettings();
+	switch (flow) {
+	case 1://(1.0.0.0)
+		Serial.println("Show temp/hum and sent to MQTT");
+		display.init(115200);
+		//getSensorData();
+		//updateScreen();
+		display.powerOff();
+		delay(100);
+		if (HOME)
+		{
+			_SSID = SSID;
+			_PSWD = PASSWORD;
+			host = SERVER_IP;
+			mqtt_server = SERVER_IP;
+		}
+		else
+		{
+			_SSID = SSID_1;
+			_PSWD = PASSWORD_1;
+			host = SERVER_IP_1;
+			mqtt_server = SERVER_IP_1;
+		}
+		setup_wifi();
+		client.setServer(mqtt_server, 1883);
+		client.setCallback(callback);
+		connectToBroker();		
+		//sendToBrocker();
+		sleep(sleepPeriod);
+		break;
+
+	case 2://(0.1.0.0)
+		Serial.println("OTA");
+		delay(100);		
+		setup_wifi();
+		checkEEPROM();
+		delay(100);
+		execOTA();		
+		break;
+
+	case 3://(0.0.1.0)
+		Serial.println("Free slot");
+		break;
+
+	case 4://(0.0.0.1)
+		Serial.println("Free slot");
+		break;
+
+	default:
+		Serial.println("Error in settings");
+		break;
+	}
 }
 
 void loop()
 {
 }
 
+
+
+int getSettings() {
+	int switch_1 = digitalRead(SETTINGS_SWITCH_1_PIN);
+	int switch_2 = digitalRead(SETTINGS_SWITCH_2_PIN);
+	int switch_3 = digitalRead(SETTINGS_SWITCH_3_PIN);
+	int switch_4 = digitalRead(SETTINGS_SWITCH_4_PIN);
+	Serial.println("Setting switches:");
+	Serial.println(switch_1);
+	Serial.println(switch_2);
+	Serial.println(switch_3);
+	Serial.println(switch_4);
+	if (switch_1 == 1 && switch_2 == 0 && switch_3 == 0 && switch_4 == 0)
+	{
+		return 1;
+	}
+	else if (switch_1 == 0 && switch_2 == 1 && switch_3 == 0 && switch_4 == 0)
+	{
+		return 2;
+	}
+	else if (switch_1 == 0 && switch_2 == 0 && switch_3 == 1 && switch_4 == 0)
+	{
+		return 3;
+	}
+	else if (switch_1 == 0 && switch_2 == 0 && switch_3 == 0 && switch_4 == 1)
+	{
+		return 4;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+void setup_wifi() {
+	// We start by connecting to a WiFi network
+
+	Serial.print(F("Connecting to "));
+	Serial.println(_SSID);
+
+	WiFi.begin(_SSID, _PSWD);
+	delay(3000);
+
+	if (WiFi.waitForConnectResult() != WL_CONNECTED) {
+
+		Serial.println(F("Connection Failed!"));
+		return;
+	}
+}
+
+// Utility to extract header value from headers
+String getHeaderValue(String header, String headerName) {
+	return header.substring(strlen(headerName.c_str()));
+}
+
+// Used for storing of MD5 hash
+void checkEEPROM() {
+	if (!EEPROM.begin(EEPROM_SIZE)) {
+
+		Serial.println("Failed to initialise EEPROM");
+		Serial.println("Restarting...");
+
+		delay(1000);
+		ESP.restart();
+	}
+}
+
+void saveMD5toEEPROM() {
+
+	Serial.println("Writing MD5 to EEPROM : " + MD5);
+
+	EEPROM.writeString(MD5_address, MD5);
+	EEPROM.commit();
+
+	if (EEPROM.readString(MD5_address) == MD5)
+	{
+		Serial.println("Successfully written MD5 to EEPROM : " + EEPROM.readString(MD5_address));
+	}
+	else
+	{
+		Serial.println("Failed to write MD5 to EEPROM : " + MD5);
+		Serial.println("MD5 in EEPROM : " + EEPROM.readString(MD5_address));
+	}
+
+}
+
+String loadMD5FromEEPROM() {
+
+	Serial.println("Loaded MD5 from EEPROM : " + EEPROM.readString(MD5_address));
+
+	return EEPROM.readString(MD5_address);
+}
+
+// OTA Logic ESP-32
+void execOTA() {
+
+	Serial.println("Connecting to: " + String(host));
+
+	// Connect to S3
+	if (espClient.connect(host.c_str(), port)) {
+		// Connection Succeed.
+		// Fecthing the bin
+
+		Serial.println("Fetching Bin: " + String(binPath));
+
+		// Get the contents of the bin file
+		espClient.print(String("GET ") + binPath + " HTTP/1.1\r\n" +
+			"Host: " + host + "\r\n" +
+			"Cache-Control: no-cache\r\n" +
+			"User-agent: esp-32\r\n" +
+			"MD5: " + loadMD5FromEEPROM() + "\r\n" +
+			"Connection: close\r\n\r\n");
+
+		unsigned long timeout = millis();
+		while (espClient.available() == 0) {
+			if (millis() - timeout > 5000) {
+
+				Serial.println("Client Timeout !");
+
+				espClient.stop();
+				return;
+			}
+		}
+
+		while (espClient.available()) {
+			// read line till /n
+			String line = espClient.readStringUntil('\n');
+			// remove space, to check if the line is end of headers
+			line.trim();
+
+			Serial.println(line);
+
+			// if the the line is empty,
+			// this is end of headers
+			// break the while and feed the
+			// remaining `client` to the
+			// Update.writeStream();
+			if (!line.length()) {
+				//headers ended
+				break; // and get the OTA started
+			}
+
+			// Check if the HTTP Response is 200
+			// else break and Exit Update
+			if (line.startsWith("HTTP/1.1")) {
+				if (line.indexOf("200") < 0) {
+
+					Serial.println("Got a non 200 status code from server. Exiting OTA Update.");
+
+					break;
+				}
+			}
+
+			// extract headers here
+			// Start with content length
+			if (line.startsWith("Content-Length: ")) {
+				contentLength = atoi((getHeaderValue(line, "Content-Length: ")).c_str());
+
+				Serial.println("Got " + String(contentLength) + " bytes from server");
+
+			}
+
+			// Next, the content type
+			if (line.startsWith("Content-Type: ")) {
+				String contentType = getHeaderValue(line, "Content-Type: ");
+
+				Serial.println("Got " + contentType + " payload.");
+
+				if (contentType == "application/octet-stream") {
+					isValidContentType = true;
+				}
+			}
+			// Get MD5 from response and compare with stored MD5
+			if (line.startsWith("md5: ")) {
+				MD5 = getHeaderValue(line, "md5: ");
+
+				Serial.println("Got md5 from response : " + MD5);
+				Serial.print("Size of md5 : ");
+				Serial.println(sizeof(MD5));
+
+				if (!MD5.equals(loadMD5FromEEPROM()) && sizeof(MD5) > 10) {
+					isNewFirmware = true;
+				}
+				else
+				{
+					isNewFirmware = false;
+				}
+			}
+		}
+	}
+	else {
+		// Connect to S3 failed
+		// May be try?
+		// Probably a choppy network?
+
+		Serial.println("Connection to " + String(host) + " failed. Please check your setup");
+
+		// retry??
+		// execOTA();
+	}
+
+	// Check what is the contentLength and if content type is `application/octet-stream`
+
+	Serial.println("contentLength : " + String(contentLength));
+	Serial.println("isValidContentType : " + String(isValidContentType));
+	Serial.println("isNewFirmware : " + String(isNewFirmware));
+
+	// check contentLength and content type
+	if (contentLength && isValidContentType) {
+		if (isNewFirmware)
+		{
+			// Check if there is enough to OTA Update
+			bool canBegin = Update.begin(contentLength);
+
+			// If yes, begin
+			if (canBegin) {
+
+				Serial.println("Begin OTA. This may take 2 - 5 mins to complete. Things might be quite for a while.. Patience!");
+
+				// No activity would appear on the Serial monitor
+				// So be patient. This may take 2 - 5mins to complete
+				size_t written = Update.writeStream(espClient);
+
+				if (written == contentLength) {
+					Serial.println("Written : " + String(written) + " successfully");
+				}
+				else {
+					Serial.println("Written only : " + String(written) + "/" + String(contentLength) + ". Retry?");
+					// retry??
+					// execOTA();
+				}
+
+				if (Update.end()) {
+
+					Serial.println("OTA done!");
+
+					if (Update.isFinished()) {
+
+						Serial.println("Update successfully completed. Rebooting.");
+
+						saveMD5toEEPROM();
+						ESP.restart();
+					}
+					else {
+
+						Serial.println("Update not finished? Something went wrong!");
+
+					}
+				}
+				else {
+
+					Serial.println("Error Occurred. Error #: " + String(Update.getError()));
+
+				}
+			}
+			else {
+				// not enough space to begin OTA
+				// Understand the partitions and
+				// space availability
+
+				Serial.println("Not enough space to begin OTA");
+
+				espClient.flush();
+			}
+		}
+		else
+		{
+
+			Serial.println("There is no new firmware");
+
+			espClient.flush();
+		}
+	}
+	else {
+
+		Serial.println("There was no content in the response");
+
+		espClient.flush();
+	}
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+	Serial.print("Message arrived [");
+	Serial.print(topic);
+	Serial.print("] ");
+	for (int i = 0; i < length; i++) {
+		Serial.print((char)payload[i]);
+	}
+	Serial.println("");
+
+	if (strcmp(topic, "Battery/restart") == 0) {
+		//Restart ESP to update flash
+		ESP.restart();
+	}
+	if (strcmp(topic, "Battery/sensorRequestPeriod") == 0) {
+		String myString = String((char*)payload);
+		sensorRequestPeriod = myString.toInt();
+
+		Serial.println(myString);
+		Serial.print("Sensor request period set to :");
+		Serial.print(sensorRequestPeriod);
+		Serial.println(" seconds");
+	}
+	if (strcmp(topic, "Battery/sleepPeriod") == 0) {
+		String myString = String((char*)payload);
+		Serial.println(myString);
+		sleepPeriod = myString.toInt();
+		String sleepPeriodMessage = String() + "Battery(ESP32) sleep period set to : " + sleepPeriod + " seconds";
+		Serial.println(sleepPeriodMessage);
+		client.publish("Battery/status", sleepPeriodMessage.c_str());
+	}
+}
+
+//Connection to MQTT broker
+void connectToBroker() {
+
+	Serial.print("Attempting MQTT connection...");
+
+	// Attempt to connect
+	if (client.connect("Battery")) {
+
+		Serial.println("ESP32 сonnected to MQTT broker");
+
+		// Once connected, publish an announcement...
+		client.publish("Battery/status", "Battery(ESP32) connected");
+		// ... and resubscribe
+		client.subscribe("Battery/sensorRequestPeriod");
+		client.subscribe("Battery/restart");
+		client.subscribe("Battery/sleepPeriod");
+	}
+	else {
+		Serial.print("failed, rc=");
+		Serial.print(client.state());
+		Serial.println(" try again in 60 seconds");
+	}
+}
+
+void sleep(int sleepTimeInSeconds) {
+	Serial.print("Go to deep sleep for ");
+	Serial.print(sleepTimeInSeconds);
+	Serial.println(" seconds");
+	// Once connected, publish an announcement...
+	client.publish("Battery/status", "Battery(ESP32) goes to sleep for " + sleepTimeInSeconds);
+	delay(3000);
+	esp_deep_sleep(sleepTimeInSeconds * 1000000);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 void helloWorld()
 {
 	//Serial.println("helloWorld");
 	display.setRotation(1);
 	display.setFont(&FreeMonoBold9pt7b);
-	display.setTextColor(GxEPD_BLACK);
+	display.setTextColor(GxEPD_RED);
 	uint16_t x = (display.width() - 160) / 2;
 	uint16_t y = display.height() / 2;
 	display.setFullWindow();
@@ -75,12 +522,12 @@ void helloWorld()
 		display.setCursor(x, y);
 		display.println("Hello World!");
 	} while (display.nextPage());
-	//Serial.println("helloWorld done");
+	Serial.println("helloWorld done");
 }
 
 void helloFullScreenPartialMode()
 {
-	//Serial.println("helloFullScreenPartialMode");
+	Serial.println("helloFullScreenPartialMode");
 	display.setPartialWindow(0, 0, display.width(), display.height());
 	display.setRotation(1);
 	display.setFont(&FreeMonoBold9pt7b);
